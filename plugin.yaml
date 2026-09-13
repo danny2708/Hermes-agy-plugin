@@ -1,0 +1,14 @@
+name: antigravity
+kind: model-provider
+version: 1.0.0
+description: Local Google Antigravity bridge for Hermes Agent (Gemini & Claude via agy CLI)
+author: Kian
+license: MIT
+platforms:
+  - windows
+  - linux
+  - darwin
+capabilities:
+  provides_tools: []
+  provides_hooks: []
+  provides_middleware: []
