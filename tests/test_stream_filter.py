@@ -4,8 +4,10 @@ import unittest
 import sys
 import os
 
-# Add plugin to path
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "..", "G:", "Work", "Side-Projects", "Hermes-agy-plugin")))
+# Add plugin root to sys.path portably
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 import agy_bridge
 
 

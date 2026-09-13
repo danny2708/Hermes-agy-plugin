@@ -376,7 +376,27 @@ def fetch_raw_agy_model_entries() -> List[Tuple[str, str]]:
             creationflags=CREATE_NO_WINDOW,
         )
         if res.returncode == 0 and res.stdout:
-            lines = res.stdout.strip().splitlines()
+            raw_out = res.stdout.strip()
+            # Forward-compatible: check if CLI returns structured JSON
+            if raw_out.startswith(("{", "[")):
+                try:
+                    parsed = json.loads(raw_out)
+                    items = parsed if isinstance(parsed, list) else parsed.get("models", parsed.get("data", []))
+                    json_entries: List[Tuple[str, str]] = []
+                    for item in items:
+                        if isinstance(item, dict):
+                            slug = item.get("id") or item.get("name") or item.get("model") or ""
+                            dname = item.get("display_name") or item.get("description") or slug
+                            if slug:
+                                json_entries.append((slug, dname))
+                        elif isinstance(item, str) and item:
+                            json_entries.append((item, item))
+                    if json_entries:
+                        return json_entries
+                except Exception:
+                    pass
+
+            lines = raw_out.splitlines()
             entries: List[Tuple[str, str]] = []
             for line in lines:
                 line_s = line.strip()
@@ -1107,14 +1127,27 @@ class OpenAIBaseHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:
         logger.info("%s - - [%s] %s", self.client_address[0], self.log_date_time_string(), format % args)
 
+    def _get_trusted_origin(self) -> Optional[str]:
+        """Validate incoming browser Origin. Allow only local loopback or desktop webviews."""
+        origin = self.headers.get("Origin", "").strip()
+        if not origin:
+            return None
+        if re.match(r"^https?://(?:localhost|127\.0\.0\.1)(?::\d+)?$", origin, re.IGNORECASE):
+            return origin
+        if origin.startswith(("vscode-webview://", "app://")):
+            return origin
+        return None
+
     def _send_json(self, status: int, payload: Dict[str, Any]) -> None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        trusted_origin = self._get_trusted_origin()
+        if trusted_origin:
+            self.send_header("Access-Control-Allow-Origin", trusted_origin)
+            self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type, X-API-Key, X-Reasoning-Effort")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.end_headers()
         self.wfile.write(data)
 
@@ -1129,16 +1162,25 @@ class OpenAIBaseHandler(BaseHTTPRequestHandler):
             token = auth_hdr[7:].strip()
         else:
             token = auth_hdr
-        return token in (expected, "local-agy")
+        return token == expected
 
     def do_OPTIONS(self) -> None:
-        self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.end_headers()
+        trusted_origin = self._get_trusted_origin()
+        if trusted_origin:
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", trusted_origin)
+            self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type, X-API-Key, X-Reasoning-Effort")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.end_headers()
+        else:
+            self.send_response(403)
+            self.end_headers()
 
     def do_GET(self) -> None:
+        if self.headers.get("Origin") and not self._get_trusted_origin():
+            self._send_json(403, {"error": {"message": "Forbidden: Untrusted cross-origin browser request", "type": "access_denied"}})
+            return
+
         path = self.path.split("?")[0].rstrip("/")
         if path in ("", "/health"):
             catalog, _, _, _ = get_models_catalog()
@@ -1166,6 +1208,10 @@ class OpenAIBaseHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": {"message": f"Not found: {path}", "type": "invalid_request_error"}})
 
     def do_POST(self) -> None:
+        if self.headers.get("Origin") and not self._get_trusted_origin():
+            self._send_json(403, {"error": {"message": "Forbidden: Untrusted cross-origin browser request", "type": "access_denied"}})
+            return
+
         path = self.path.split("?")[0].rstrip("/")
         if path not in ("/chat/completions", "/v1/chat/completions"):
             self._send_json(404, {"error": {"message": f"Not found: {path}", "type": "invalid_request_error"}})
@@ -1228,8 +1274,9 @@ class OpenAIBaseHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "close")
-            self.send_header("X-Accel-Buffering", "no")
-            self.send_header("Access-Control-Allow-Origin", "*")
+            trusted_origin = self._get_trusted_origin()
+            if trusted_origin:
+                self.send_header("Access-Control-Allow-Origin", trusted_origin)
             self.end_headers()
 
             write_lock = threading.Lock()

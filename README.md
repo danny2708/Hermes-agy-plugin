@@ -1,5 +1,7 @@
 # Hermes Google Antigravity Provider Plugin
 
+[![CI](https://github.com/danny2708/Hermes-agy-plugin/actions/workflows/ci.yml/badge.svg)](https://github.com/danny2708/Hermes-agy-plugin/actions/workflows/ci.yml)
+
 A native model-provider plugin (`kind: model-provider`) for **[Hermes Agent](https://github.com/nousresearch/hermes-agent)** and **Hermes Desktop**, enabling local inference routing through **Google Antigravity** (`agy` CLI).
 
 ---
@@ -16,9 +18,10 @@ A native model-provider plugin (`kind: model-provider`) for **[Hermes Agent](htt
   - Translates model `<tool_call>` outputs into standard OpenAI `tool_calls` chunks in real-time.
   - Full compatibility with Hermes' built-in tools (terminal execution, file manipulation, web search, MCP servers, and custom tools).
 - **Hardened Security Architecture:**
-  - **No dangerous overrides**: Does **NOT** pass `--dangerously-skip-permissions`. In `stream-json` mode, `permission_mode` defaults to `request-review`. Antigravity native tools cannot execute arbitrary host commands without review, ensuring **Hermes remains the sole tool execution authority**.
+  - **No dangerous overrides**: Does **NOT** pass `--dangerously-skip-permissions`. In `stream-json` mode, `permission_mode` defaults to `request-review`. Antigravity native tool execution is constrained by AGY's request-review policy and terminal sandbox, while actionable host operations are intended to flow through Hermes tools.
   - **Terminal sandboxing**: Runs `agy` with `--sandbox` and `--disable-slash-commands` to prevent unintended command expansion.
-  - **Local Bearer Token Auth**: Protects the HTTP bridge (`127.0.0.1:8765`) using an ephemeral local token (`agy-bridge_token.secret`), preventing unauthorized local processes from consuming quota.
+  - **Local Bearer Token Auth**: Protects the HTTP bridge (`127.0.0.1:8765`) using an ephemeral local token (`agy-bridge_token.secret`), requiring exact token matching and rejecting unauthorized local processes.
+  - **Strict Origin & Loopback CORS**: Restricts cross-origin requests to local loopback (`localhost`, `127.0.0.1`) and desktop schemes (`app://`, `vscode-webview://`), rejecting arbitrary browser origins with `403 Forbidden` to prevent browser-based CSRF/drive-by attacks.
 - **Privacy-Aware Tool Logging (`logs/agy_tools.log`):**
   - **`[TOOL CALL DISPATCHED]`**: Tool name, call ID, formatted payload.
   - **`[TOOL RESULT RECEIVED]`**: Tool name, call ID, execution latency, status (`SUCCESS / OUTPUT` vs `FAILED / ERROR`), character size, and formatted result payload.
