@@ -12,14 +12,12 @@ import os
 import sys
 from typing import Any, List, Optional, Tuple
 
-from .bridge_manager import ensure_bridge_running, is_bridge_healthy, is_update_in_progress
+from .bridge_manager import ensure_bridge_running, get_or_create_auth_token, is_bridge_healthy, is_update_in_progress
 
 logger = logging.getLogger("hermes.plugins.antigravity")
 
-# Hermes' generic OpenAI transport requires an API-key-shaped value even for
-# a loopback, keyless provider. The bridge ignores the token; set a local-only
-# placeholder so explicit resolution works without external secrets.
-os.environ.setdefault("AGY_API_KEY", "local-agy")
+_LOCAL_TOKEN = get_or_create_auth_token()
+os.environ.setdefault("AGY_API_KEY", _LOCAL_TOKEN)
 
 try:
     from providers import register_provider
@@ -99,7 +97,7 @@ class AntigravityProfile(ProviderProfile):
 
         if hasattr(super(), "fetch_models"):
             models = super().fetch_models(
-                api_key=api_key or "local-agy",
+                api_key=api_key or _LOCAL_TOKEN,
                 base_url=base_url or getattr(self, "base_url", "http://127.0.0.1:8765/v1"),
                 timeout=timeout,
             )
@@ -111,7 +109,13 @@ class AntigravityProfile(ProviderProfile):
         import urllib.request
         target_url = (base_url or getattr(self, "base_url", "http://127.0.0.1:8765/v1")).rstrip("/") + "/models"
         try:
-            req = urllib.request.Request(target_url, headers={"User-Agent": "hermes-antigravity-plugin"})
+            req = urllib.request.Request(
+                target_url,
+                headers={
+                    "User-Agent": "hermes-antigravity-plugin",
+                    "Authorization": f"Bearer {_LOCAL_TOKEN}",
+                },
+            )
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 if resp.status == 200:
                     data = json.loads(resp.read().decode("utf-8"))
@@ -137,7 +141,7 @@ antigravity = AntigravityProfile(
     env_vars=("AGY_API_KEY",),
     base_url="http://127.0.0.1:8765/v1",
     api_mode="chat_completions",
-    default_headers={"Authorization": "Bearer local-agy"},
+    default_headers={"Authorization": f"Bearer {_LOCAL_TOKEN}"},
     default_aux_model="gemini-3.8-flash",
     fallback_models=(
         "gemini-3.8-flash",

@@ -1,26 +1,35 @@
 # Hermes Google Antigravity Provider Plugin
 
-A native model-provider plugin (`kind: model-provider`) for **[Hermes Agent](https://github.com/nousresearch/hermes-agent)** and **Hermes Desktop**, enabling seamless local inference routing through **Google Antigravity** (`agy` CLI).
+A native model-provider plugin (`kind: model-provider`) for **[Hermes Agent](https://github.com/nousresearch/hermes-agent)** and **Hermes Desktop**, enabling local inference routing through **Google Antigravity** (`agy` CLI).
 
 ---
 
 ## Key Features
 
-- **100% Dynamic Model Discovery:**
-  - Queries `agy models` at runtime to automatically discover and register all available models (Gemini 3.8 Flash, Gemini 3.7 Flash, Gemini 3.1 Pro, Claude Sonnet 4.6, Claude Opus 4.6, GPT-OSS 120B, etc.).
-  - Zero code modifications required when Google releases or updates models.
+- **Dynamic Model Discovery (via official `agy models` CLI):**
+  - Directly queries `agy models` to discover and register all active models (Gemini 3.8 Flash, Gemini 3.7 Flash, Gemini 3.1 Pro, Claude Sonnet 4.6, Claude Opus 4.6, GPT-OSS 120B, etc.).
+  - Includes a fallback catalog to guarantee uninterrupted service if the CLI query is delayed or offline.
 - **Real-Time Chain-of-Thought (CoT) Streaming:**
-  - Intercepts `<think>...</think>` reasoning tokens on the fly and streams them directly into Hermes under `reasoning_content`.
-  - Supports reasoning effort mapping (`minimal`, `low`, `medium`, `high`).
-- **Native Tool Calling:**
+  - Streams `<think>...</think>` reasoning tokens directly into Hermes under `reasoning_content`.
+  - Maps reasoning effort dials (`minimal`, `low`, `medium`, `high`) to corresponding model variants.
+- **Hermes-Compatible Streamed Tool Calling:**
   - Translates model `<tool_call>` outputs into standard OpenAI `tool_calls` chunks in real-time.
   - Full compatibility with Hermes' built-in tools (terminal execution, file manipulation, web search, MCP servers, and custom tools).
-- **Dedicated Tool Execution Logging (`logs/agy_tools.log`):**
-  - **`[TOOL CALL DISPATCHED]`**: Captures tool name, call ID, and pretty-printed JSON parameters.
-  - **`[TOOL RESULT RECEIVED]`**: Captures tool name, matching call ID, execution latency, status (`SUCCESS / OUTPUT` vs `FAILED / ERROR`), character size, and formatted result payload.
-  - Multi-turn fingerprint deduplication prevents spamming redundant conversation history.
+- **Hardened Security Architecture:**
+  - **No dangerous overrides**: Does **NOT** pass `--dangerously-skip-permissions`. In `stream-json` mode, `permission_mode` defaults to `request-review`. Antigravity native tools cannot execute arbitrary host commands without review, ensuring **Hermes remains the sole tool execution authority**.
+  - **Terminal sandboxing**: Runs `agy` with `--sandbox` and `--disable-slash-commands` to prevent unintended command expansion.
+  - **Local Bearer Token Auth**: Protects the HTTP bridge (`127.0.0.1:8765`) using an ephemeral local token (`agy-bridge_token.secret`), preventing unauthorized local processes from consuming quota.
+- **Privacy-Aware Tool Logging (`logs/agy_tools.log`):**
+  - **`[TOOL CALL DISPATCHED]`**: Tool name, call ID, formatted payload.
+  - **`[TOOL RESULT RECEIVED]`**: Tool name, call ID, execution latency, status (`SUCCESS / OUTPUT` vs `FAILED / ERROR`), character size, and formatted result payload.
+  - **Automatic Credential Redaction**: Automatically masks Bearer tokens, OpenAI/Google API keys, passwords, and PEM private keys before writing to disk.
+  - **Privacy Dials**: Configure logging behavior via environment variables:
+    - `AGY_LOG_TOOL_ARGS=false` (disables logging tool call arguments)
+    - `AGY_LOG_TOOL_RESULTS=false` (disables logging tool output content)
+    - `AGY_LOG_MAX_PAYLOAD=4000` (caps individual payload size)
+  - **Automatic Log Rotation**: Rotates log files automatically at 5MB with 3 backups (`RotatingFileHandler`).
 - **Intelligent Lifecycle & Anti-Lock Architecture:**
-  - **Isolated Python Runtime**: Automatically locates an external, system-level Python interpreter outside the `hermes-agent\venv` environment, preventing Windows file-lock errors during Hermes self-updates.
+  - **Isolated Python Runtime**: Automatically discovers an external, system-level Python interpreter outside `hermes-agent\venv`, preventing Windows file-lock errors during Hermes self-updates.
   - **Update Watchdog**: Automatically suspends bridge spawning when an active update is detected, then safely resumes once the update completes.
   - **SSE Heartbeat Keep-Alive**: Prevents idle timeouts during long reasoning or complex multi-turn deliberation.
   - **Alias Backward-Compatibility**: Supports both `--provider antigravity` and `--provider agy`.
@@ -110,7 +119,7 @@ hermes --provider agy --model claude-sonnet-4.6
 
 The bridge maintains clean, separated logs inside your `$HERMES_HOME/logs/` directory.
 
-### Monitor Tool Calling Activity (Recommended):
+### Monitor Tool Calling Activity:
 View real-time tool calls, payloads, latencies, and execution outputs:
 ```powershell
 Get-Content -Path "$env:HERMES_HOME\logs\agy_tools.log" -Wait -Tail 30
@@ -149,6 +158,20 @@ Get-Content -Path "$env:HERMES_HOME\logs\agy_bridge.log" -Wait -Tail 30
 
 ---
 
+## Testing
+
+Run the included unit test suite:
+```bash
+python -m unittest discover -s tests -p "test_*.py"
+```
+The test suite covers:
+- `StreamToolCallFilter` state machine and token chunk fragmentation.
+- Credential and token redaction (`redact_sensitive_content`).
+- Model catalog indexing and effort resolution (`agy models` format).
+- Local Bearer token authorization checks.
+
+---
+
 ## Repository Structure
 
 ```text
@@ -159,6 +182,11 @@ Hermes-agy-plugin/
 ├── bridge_manager.py    # Process supervisor, external Python selector, health check & watchdog
 ├── install.bat          # 1-click Windows batch launcher
 ├── install.ps1          # Automated PowerShell installation script
+├── tests/               # Automated unit test suite
+│   ├── test_stream_filter.py
+│   ├── test_redaction.py
+│   ├── test_model_catalog.py
+│   └── test_auth.py
 └── README.md            # Documentation and usage guide
 ```
 
@@ -172,6 +200,7 @@ Hermes-agy-plugin/
 │             (CLI / Desktop / Web UI / MCP)             │
 └──────────────────────────┬─────────────────────────────┘
                            │ OpenAI Chat Completions API
+                           │ (Bearer Token Authenticated)
                            ▼
 ┌────────────────────────────────────────────────────────┐
 │           Antigravity Local HTTP Bridge                │
@@ -180,9 +209,10 @@ Hermes-agy-plugin/
 │  • SSE Stream Filter & Heartbeat Engine                │
 │  • <think>...</think> -> reasoning_content extraction  │
 │  • <tool_call>...</tool_call> -> OpenAI Tool Chunks    │
-│  • Dedicated Tool Logger (logs/agy_tools.log)          │
+│  • Privacy Redactor & Rotating Logger (agy_tools.log)  │
 └──────────────────────────┬─────────────────────────────┘
-                           │ CLI Subprocess Invocation
+                           │ Sandboxed CLI Invocations
+                           │ (--input-format stream-json --sandbox)
                            ▼
 ┌────────────────────────────────────────────────────────┐
 │             Google Antigravity CLI (agy)               │
@@ -192,8 +222,8 @@ Hermes-agy-plugin/
 
 1. **Lazy Initialization:** When Hermes makes its first inference request, `__init__.py` invokes `bridge_manager.ensure_bridge_running()`.
 2. **Independent Spawning:** The bridge is spawned silently in the background using a system-level Python interpreter to keep `hermes-agent\venv` completely unlocked.
-3. **Translation Layer:** `agy_bridge.py` converts Hermes' chat history into Antigravity CLI arguments, runs `agy`, and streams standard OpenAI Server-Sent Events (SSE) back to Hermes.
-4. **Tool Parsing & Logging:** Tool declarations and invocations are transformed transparently between XML markup and OpenAI JSON tool calls, while logging every dispatch and result for easy debugging.
+3. **Translation Layer:** `agy_bridge.py` converts Hermes' chat history into Antigravity CLI arguments, runs `agy` in sandboxed `stream-json` mode, and streams standard OpenAI Server-Sent Events (SSE) back to Hermes.
+4. **Tool Parsing & Logging:** Tool declarations and invocations are transformed transparently between XML markup and OpenAI JSON tool calls, while logging every dispatch and result with automatic credential redaction.
 
 ---
 
@@ -208,7 +238,7 @@ Hermes-agy-plugin/
   ```powershell
   curl http://127.0.0.1:8765/health
   ```
-  Expected response: `{"status": "ok", "service": "agy_bridge"}`.
+  Expected response: `{"status": "ok", "service": "agy-bridge", "models_count": ...}`.
 
 ---
 

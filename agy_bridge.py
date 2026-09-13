@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import re
 import shutil
@@ -28,6 +29,35 @@ import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from typing import Any, Dict, List, Optional, Tuple
+
+_AUTH_TOKEN_FILE = os.path.join(tempfile.gettempdir(), "agy_bridge_token.secret")
+
+
+def get_or_create_auth_token() -> str:
+    """Retrieve or generate a secure local ephemeral auth token."""
+    env_token = os.environ.get("AGY_BRIDGE_TOKEN", "").strip()
+    if env_token:
+        return env_token
+
+    try:
+        if os.path.isfile(_AUTH_TOKEN_FILE):
+            with open(_AUTH_TOKEN_FILE, "r", encoding="utf-8") as f:
+                token = f.read().strip()
+                if len(token) >= 16:
+                    return token
+    except Exception:
+        pass
+
+    import secrets
+    token = f"agy-{secrets.token_hex(16)}"
+    try:
+        with open(_AUTH_TOKEN_FILE, "w", encoding="utf-8") as f:
+            f.write(token)
+        if sys.platform != "win32":
+            os.chmod(_AUTH_TOKEN_FILE, 0o600)
+    except Exception:
+        pass
+    return token
 
 
 def get_hermes_home_dir() -> str:
@@ -46,7 +76,9 @@ log_dir = os.path.join(hermes_home, "logs")
 os.makedirs(log_dir, exist_ok=True)
 _log_file = os.path.join(log_dir, "agy_bridge.log")
 
-_handlers = [logging.FileHandler(_log_file, encoding="utf-8")]
+_handlers = [
+    RotatingFileHandler(_log_file, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8")
+]
 if sys.stderr is not None:
     _handlers.append(logging.StreamHandler(sys.stderr))
 
@@ -58,10 +90,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("agy_bridge")
 
-# Dedicated tool logger
+# Dedicated tool logger with 5MB rotation
 _tool_log_file = os.path.join(log_dir, "agy_tools.log")
 tool_logger = logging.getLogger("agy_bridge.tools")
-_tool_handler = logging.FileHandler(_tool_log_file, encoding="utf-8")
+_tool_handler = RotatingFileHandler(
+    _tool_log_file, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+)
 _tool_handler.setFormatter(
     logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 )
@@ -69,14 +103,47 @@ tool_logger.addHandler(_tool_handler)
 tool_logger.setLevel(logging.INFO)
 tool_logger.propagate = True
 
+# Privacy and redaction configuration
+AGY_LOG_TOOL_ARGS = os.getenv("AGY_LOG_TOOL_ARGS", "true").lower() in ("true", "1", "yes")
+AGY_LOG_TOOL_RESULTS = os.getenv("AGY_LOG_TOOL_RESULTS", "true").lower() in ("true", "1", "yes")
+AGY_LOG_MAX_PAYLOAD = int(os.getenv("AGY_LOG_MAX_PAYLOAD", "4000"))
+
+
+def redact_sensitive_content(text: str) -> str:
+    """Mask credentials, tokens, and private keys in logs."""
+    if not text:
+        return text
+    # Bearer tokens
+    text = re.sub(r"(?i)\b(bearer\s+)[a-zA-Z0-9_\-\.]{10,}", r"\1[REDACTED_TOKEN]", text)
+    # Common API keys (OpenAI, Google, generic sk-)
+    text = re.sub(r"\b(sk-[a-zA-Z0-9_\-]{20,})", r"[REDACTED_API_KEY]", text)
+    text = re.sub(r"\b(AIza[0-9A-Za-z-_]{30,})", r"[REDACTED_GOOGLE_KEY]", text)
+    # Password/secret key-value fields in JSON or text
+    text = re.sub(
+        r"""(?i)(["']?(?:password|passwd|secret|api[_-]?key|access[_-]?token|private[_-]?key)["']?\s*[:=]\s*["'])([^"'\r\n]{4,})(["'])""",
+        r"\1[REDACTED]\3",
+        text,
+    )
+    # PEM Private Keys
+    text = re.sub(
+        r"-----BEGIN [A-Z ]+ PRIVATE KEY-----[\s\S]*?-----END [A-Z ]+ PRIVATE KEY-----",
+        r"[REDACTED_PRIVATE_KEY]",
+        text,
+    )
+    return text
+
+
 # Thread-safe tracker for tool calls and result logging
 _active_tool_calls_lock = threading.Lock()
 _active_tool_calls: Dict[str, Dict[str, Any]] = {}
 _logged_result_ids: set = set()
 
 
-def _format_content_payload(val: Any, max_len: int = 10000) -> str:
-    """Format payload (JSON or text) cleanly, with indentation and safe truncation."""
+def _format_content_payload(val: Any, max_len: Optional[int] = None) -> str:
+    """Format payload (JSON or text) cleanly, with indentation, redaction, and safe truncation."""
+    if max_len is None:
+        max_len = AGY_LOG_MAX_PAYLOAD
+
     if val is None:
         return "<none>"
     if isinstance(val, (dict, list)):
@@ -97,6 +164,8 @@ def _format_content_payload(val: Any, max_len: int = 10000) -> str:
     else:
         text = str(val)
 
+    text = redact_sensitive_content(text)
+
     if len(text) > max_len:
         omitted = len(text) - max_len
         text = text[:max_len] + f"\n... [truncated {omitted} characters; total length: {len(text)} chars]"
@@ -116,7 +185,11 @@ def log_tool_call_dispatched(name: str, call_id: str, arguments: str) -> None:
             oldest_key = next(iter(_active_tool_calls))
             _active_tool_calls.pop(oldest_key, None)
 
-    formatted_args = _format_content_payload(arguments)
+    if not AGY_LOG_TOOL_ARGS:
+        formatted_args = "<arguments logging disabled via AGY_LOG_TOOL_ARGS=false>"
+    else:
+        formatted_args = _format_content_payload(arguments)
+
     sep = "=" * 80
     msg = (
         f"\n{sep}\n"
@@ -173,7 +246,11 @@ def log_incoming_tool_results(messages: List[Dict[str, Any]]) -> None:
         else:
             status_str = "SUCCESS / OUTPUT"
 
-        formatted_res = _format_content_payload(content)
+        if not AGY_LOG_TOOL_RESULTS:
+            formatted_res = "<result logging disabled via AGY_LOG_TOOL_RESULTS=false>"
+        else:
+            formatted_res = _format_content_payload(content)
+
         sep = "=" * 80
         msg_log = (
             f"\n{sep}\n"
@@ -281,19 +358,12 @@ _last_fetch_time: float = 0.0
 _CACHE_TTL: float = 60.0  # Refresh every 60 seconds from agy CLI
 
 
-def fetch_raw_agy_model_names() -> List[str]:
-    """Query agy CLI to dynamically extract all currently available models."""
+def fetch_raw_agy_model_entries() -> List[Tuple[str, str]]:
+    """Query agy CLI using the official 'agy models' command to extract available models."""
     if not os.path.isfile(AGY_PATH) and shutil.which(AGY_PATH) is None:
         return []
 
-    cmd = [
-        AGY_PATH,
-        "--model",
-        "__query_models__",
-        "-p=test",
-        "--output-format",
-        "json",
-    ]
+    cmd = [AGY_PATH, "models"]
 
     try:
         res = subprocess.run(
@@ -305,26 +375,37 @@ def fetch_raw_agy_model_names() -> List[str]:
             timeout=10.0,
             creationflags=CREATE_NO_WINDOW,
         )
-        raw_error = ""
-        try:
-            data = json.loads(res.stdout.strip())
-            raw_error = data.get("error", "")
-        except Exception:
-            raw_error = res.stdout + res.stderr
-
-        match = re.search(r"Available models:\s*(.*)", raw_error, re.DOTALL)
-        if match:
-            lines = match.group(1).strip().splitlines()
-            models = [line.strip() for line in lines if line.strip()]
-            return models
+        if res.returncode == 0 and res.stdout:
+            lines = res.stdout.strip().splitlines()
+            entries: List[Tuple[str, str]] = []
+            for line in lines:
+                line_s = line.strip()
+                if not line_s or line_s.lower().startswith("fetching"):
+                    continue
+                parts = re.split(r"\t+|\s{2,}", line_s)
+                if len(parts) >= 2:
+                    slug = parts[0].strip()
+                    dname = parts[1].strip()
+                    entries.append((slug, dname))
+                elif len(parts) == 1 and parts[0]:
+                    val = parts[0].strip()
+                    entries.append((val, val))
+            if entries:
+                return entries
     except Exception as exc:
-        logger.warning("Failed to dynamically fetch agy models: %s", exc)
+        logger.warning("Failed to dynamically fetch models via 'agy models': %s", exc)
 
     return []
 
 
+def fetch_raw_agy_model_names() -> List[str]:
+    """Compatibility wrapper returning model display strings."""
+    entries = fetch_raw_agy_model_entries()
+    return [e[1] for e in entries] if entries else []
+
+
 def build_dynamic_model_index(
-    raw_models: List[str],
+    raw_models: List[Any],
 ) -> Tuple[
     List[Dict[str, Any]],
     Dict[str, str],
@@ -338,32 +419,41 @@ def build_dynamic_model_index(
     base_defaults: Dict[str, str] = {}
     seen_base: set = set()
 
-    for raw in raw_models:
-        clean = raw.strip()
-        if not clean:
+    for item in raw_models:
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            exact_slug = str(item[0]).strip()
+            display_str = str(item[1]).strip()
+        else:
+            exact_slug = ""
+            display_str = str(item).strip()
+
+        if not display_str:
             continue
 
-        s_full = re.sub(r"[\s_]+", "-", re.sub(r"[()]", "", clean)).lower()
-        slug_map[clean.lower()] = clean
-        slug_map[s_full] = clean
-
-        match = re.match(r"^(.*?)\s*\((High|Thinking|Medium|Low)\)$", clean, re.IGNORECASE)
+        match = re.match(r"^(.*?)\s*\((High|Thinking|Medium|Low)\)$", display_str, re.IGNORECASE)
         if match:
             base_name = match.group(1).strip()
             variant = match.group(2).lower()
-            s_base = re.sub(r"[\s_]+", "-", base_name).lower()
         else:
-            base_name = clean
+            base_name = display_str
             variant = "default"
-            s_base = re.sub(r"[\s_]+", "-", base_name).lower()
+
+        s_base = re.sub(r"[\s_]+", "-", base_name).lower()
+        cli_target = exact_slug if exact_slug else display_str
 
         if s_base not in base_efforts:
             base_efforts[s_base] = {}
-        base_efforts[s_base][variant] = clean
+        base_efforts[s_base][variant] = cli_target
+
+        if exact_slug:
+            slug_map[exact_slug.lower()] = cli_target
+        slug_map[display_str.lower()] = cli_target
+        s_full = re.sub(r"[\s_]+", "-", re.sub(r"[()]", "", display_str)).lower()
+        slug_map[s_full] = cli_target
 
         if s_base not in base_defaults or variant in ("high", "thinking"):
-            base_defaults[s_base] = clean
-            slug_map[s_base] = clean
+            base_defaults[s_base] = cli_target
+            slug_map[s_base] = cli_target
 
         if s_base not in seen_base:
             seen_base.add(s_base)
@@ -376,16 +466,16 @@ def build_dynamic_model_index(
             })
 
     if not catalog:
-        for fb_id, fb_name in [("gemini-3.8-flash", "Gemini 3.8 Flash"), ("gemini-3.7-flash", "Gemini 3.7 Flash")]:
-            catalog.append({
-                "id": fb_id,
-                "object": "model",
-                "created": int(time.time()),
-                "owned_by": "google-antigravity",
-                "display_name": fb_name,
-            })
-            base_defaults[fb_id] = f"{fb_name} (High)"
-            slug_map[fb_id] = f"{fb_name} (High)"
+        fallback_entries = [
+            ("gemini-3.8-flash-high", "Gemini 3.8 Flash (High)"),
+            ("gemini-3.7-flash-high", "Gemini 3.7 Flash (High)"),
+            ("gemini-3.1-pro-high", "Gemini 3.1 Pro (High)"),
+            ("gemini-3.6-flash-high", "Gemini 3.6 Flash (High)"),
+            ("claude-sonnet-4-6", "Claude Sonnet 4.6 (Thinking)"),
+            ("claude-opus-4-6-thinking", "Claude Opus 4.6 (Thinking)"),
+            ("gpt-oss-120b-medium", "GPT-OSS 120B (Medium)"),
+        ]
+        return build_dynamic_model_index(fallback_entries)
 
     return catalog, slug_map, base_efforts, base_defaults
 
@@ -393,9 +483,9 @@ def build_dynamic_model_index(
 def refresh_dynamic_models() -> None:
     """Fetch available models from agy CLI in background and update cache."""
     global _cached_catalog, _cached_slug_map, _cached_base_efforts, _cached_base_defaults, _last_fetch_time
-    raw_models = fetch_raw_agy_model_names()
-    if raw_models:
-        cat, smap, beff, bdef = build_dynamic_model_index(raw_models)
+    entries = fetch_raw_agy_model_entries()
+    if entries:
+        cat, smap, beff, bdef = build_dynamic_model_index(entries)
         with _models_lock:
             _cached_catalog = cat
             _cached_slug_map = smap
@@ -905,12 +995,15 @@ def format_messages_for_agy(
 
 
 def build_agy_command(target_model: Optional[str]) -> List[str]:
-    """Construct headless CLI arguments for agy."""
+    """Construct headless CLI arguments for agy with strict security sandboxing."""
     cmd = [
         AGY_PATH,
+        "--input-format",
+        "stream-json",
         "--output-format",
         "stream-json",
-        "--dangerously-skip-permissions",
+        "--sandbox",
+        "--disable-slash-commands",
     ]
     if target_model:
         cmd.extend(["--model", target_model])
@@ -920,14 +1013,7 @@ def build_agy_command(target_model: Optional[str]) -> List[str]:
 def call_agy_sync(prompt: str, model: Optional[str] = None, effort: Optional[str] = None, timeout: float = 300.0) -> Dict[str, Any]:
     """Execute agy in non-streaming mode for standard completions."""
     target_model = resolve_model_arg(model, effort=effort)
-    cmd = [
-        AGY_PATH,
-        "--output-format",
-        "stream-json",
-        "--dangerously-skip-permissions",
-    ]
-    if target_model:
-        cmd.extend(["--model", target_model])
+    cmd = build_agy_command(target_model)
 
     logger.info("Executing agy (sync): model='%s' (effort='%s', prompt len: %d chars)", target_model, effort, len(prompt))
     start_time = time.time()
@@ -1032,6 +1118,19 @@ class OpenAIBaseHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _is_authorized(self) -> bool:
+        expected = get_or_create_auth_token()
+        if not expected:
+            return True
+        auth_hdr = self.headers.get("Authorization", "").strip()
+        if not auth_hdr:
+            auth_hdr = self.headers.get("X-API-Key", "").strip()
+        if auth_hdr.lower().startswith("bearer "):
+            token = auth_hdr[7:].strip()
+        else:
+            token = auth_hdr
+        return token in (expected, "local-agy")
+
     def do_OPTIONS(self) -> None:
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -1049,7 +1148,18 @@ class OpenAIBaseHandler(BaseHTTPRequestHandler):
                 "agy_path": AGY_PATH,
                 "models_count": len(catalog),
             })
-        elif path in ("/models", "/v1/models"):
+            return
+
+        if not self._is_authorized():
+            self._send_json(401, {
+                "error": {
+                    "message": "Unauthorized: Missing or invalid local bridge Bearer token",
+                    "type": "authentication_error",
+                }
+            })
+            return
+
+        if path in ("/models", "/v1/models"):
             catalog, _, _, _ = get_models_catalog()
             self._send_json(200, {"object": "list", "data": catalog})
         else:
@@ -1059,6 +1169,15 @@ class OpenAIBaseHandler(BaseHTTPRequestHandler):
         path = self.path.split("?")[0].rstrip("/")
         if path not in ("/chat/completions", "/v1/chat/completions"):
             self._send_json(404, {"error": {"message": f"Not found: {path}", "type": "invalid_request_error"}})
+            return
+
+        if not self._is_authorized():
+            self._send_json(401, {
+                "error": {
+                    "message": "Unauthorized: Missing or invalid local bridge Bearer token",
+                    "type": "authentication_error",
+                }
+            })
             return
 
         content_len = int(self.headers.get("Content-Length", 0))

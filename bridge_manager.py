@@ -23,6 +23,34 @@ BRIDGE_HEALTH_URL = "http://127.0.0.1:8765/health"
 BRIDGE_PORT = 8765
 
 _SPAWN_LOCK_FILE = os.path.join(tempfile.gettempdir(), "agy_bridge_spawn.lock")
+_AUTH_TOKEN_FILE = os.path.join(tempfile.gettempdir(), "agy_bridge_token.secret")
+
+
+def get_or_create_auth_token() -> str:
+    """Retrieve or generate a secure local ephemeral auth token."""
+    env_token = os.environ.get("AGY_BRIDGE_TOKEN", "").strip()
+    if env_token:
+        return env_token
+
+    try:
+        if os.path.isfile(_AUTH_TOKEN_FILE):
+            with open(_AUTH_TOKEN_FILE, "r", encoding="utf-8") as f:
+                token = f.read().strip()
+                if len(token) >= 16:
+                    return token
+    except Exception:
+        pass
+
+    import secrets
+    token = f"agy-{secrets.token_hex(16)}"
+    try:
+        with open(_AUTH_TOKEN_FILE, "w", encoding="utf-8") as f:
+            f.write(token)
+        if sys.platform != "win32":
+            os.chmod(_AUTH_TOKEN_FILE, 0o600)
+    except Exception:
+        pass
+    return token
 
 
 def get_hermes_home_dir() -> str:
