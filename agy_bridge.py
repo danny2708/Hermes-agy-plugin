@@ -14,6 +14,8 @@ Features:
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import logging
 from logging.handlers import RotatingFileHandler
@@ -26,6 +28,7 @@ import tempfile
 import threading
 import time
 import uuid
+from urllib.parse import unquote, urlparse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from typing import Any, Dict, List, Optional, Tuple
@@ -269,13 +272,13 @@ def log_incoming_tool_results(messages: List[Dict[str, Any]]) -> None:
 HOST = "127.0.0.1"
 PORT = 8765
 
-MAX_AGY_PROMPT_CHARS = int(os.getenv("AGY_BRIDGE_MAX_PROMPT_CHARS", "120000"))
-AGY_SYSTEM_BUDGET_CHARS = int(os.getenv("AGY_BRIDGE_SYSTEM_BUDGET_CHARS", "70000"))
+MAX_AGY_PROMPT_CHARS = int(os.getenv("AGY_BRIDGE_MAX_PROMPT_CHARS", "350000"))
+AGY_SYSTEM_BUDGET_CHARS = int(os.getenv("AGY_BRIDGE_SYSTEM_BUDGET_CHARS", "80000"))
 AGY_CURRENT_REQUEST_BUDGET_CHARS = int(
-    os.getenv("AGY_BRIDGE_CURRENT_REQUEST_BUDGET_CHARS", "30000")
+    os.getenv("AGY_BRIDGE_CURRENT_REQUEST_BUDGET_CHARS", "40000")
 )
 AGY_CURRENT_WORK_BUDGET_CHARS = int(
-    os.getenv("AGY_BRIDGE_CURRENT_WORK_BUDGET_CHARS", "10000")
+    os.getenv("AGY_BRIDGE_CURRENT_WORK_BUDGET_CHARS", "180000")
 )
 
 BRIDGE_SCRATCH_DIR = os.path.join(tempfile.gettempdir(), "agy_bridge_work")
@@ -872,14 +875,20 @@ def extract_tool_calls_from_text(text: str) -> Tuple[List[Dict[str, Any]], str]:
     return final_tcs, (txt + txt_flush).strip()
 
 
-def _clip_prompt_section(text: str, limit: int, *, keep_tail: bool = False) -> str:
+def _clip_prompt_section(
+    text: str, limit: int, *, keep_tail: bool = False, keep_both: bool = False
+) -> str:
     """Bound a prompt section while making every omission explicit."""
     if limit <= 0:
         return ""
     if len(text) <= limit:
         return text
-    marker = "\n\n[... older content omitted by AGY bridge safety limit ...]\n\n"
+    marker = "\n\n[... older intermediate tool output omitted by AGY bridge safety limit ...]\n\n"
     available = max(0, limit - len(marker))
+    if keep_both:
+        head = available // 4
+        tail = available - head
+        return text[:head] + marker + (text[-tail:] if tail else "")
     if keep_tail:
         return marker + text[-available:]
     head = available * 2 // 3
@@ -890,9 +899,82 @@ def _clip_prompt_section(text: str, limit: int, *, keep_tail: bool = False) -> s
 def _message_text(msg: Dict[str, Any]) -> str:
     content = msg.get("content", "")
     if isinstance(content, list):
-        return "\n".join(
-            p.get("text", "") for p in content if isinstance(p, dict) and "text" in p
-        )
+        parts: List[str] = []
+        for p in content:
+            if not isinstance(p, dict):
+                if p:
+                    parts.append(str(p))
+                continue
+            ptype = p.get("type", "")
+            if ptype == "text" or ("text" in p and ptype != "image_url"):
+                txt = p.get("text", "")
+                if txt:
+                    parts.append(str(txt))
+            elif ptype == "image_url" or "image_url" in p:
+                img_info = p.get("image_url", {})
+                url = (
+                    img_info.get("url", "")
+                    if isinstance(img_info, dict)
+                    else (img_info if isinstance(img_info, str) else "")
+                )
+                if not url and "url" in p:
+                    url = str(p["url"])
+
+                if not url:
+                    continue
+
+                if url.startswith("data:image/"):
+                    try:
+                        header, b64_data = url.split(",", 1)
+                        mime = header.split(";")[0].replace("data:", "").strip().lower()
+                        ext = "png"
+                        if "jpeg" in mime or "jpg" in mime:
+                            ext = "jpg"
+                        elif "webp" in mime:
+                            ext = "webp"
+                        elif "gif" in mime:
+                            ext = "gif"
+
+                        img_hash = hashlib.md5(b64_data[:200].encode("utf-8")).hexdigest()[:12]
+                        temp_img_path = os.path.join(
+                            BRIDGE_SCRATCH_DIR, f"vision_input_{img_hash}.{ext}"
+                        )
+                        if not os.path.exists(temp_img_path):
+                            with open(temp_img_path, "wb") as img_f:
+                                img_f.write(base64.b64decode(b64_data))
+                        parts.append(
+                            f"\n[Attached Image File: {temp_img_path}]\n"
+                            f"Please inspect and analyze the image at: {temp_img_path}\n"
+                        )
+                    except Exception as ex:
+                        logger.warning("Failed to decode base64 image_url: %s", ex)
+                elif url.startswith("file://"):
+                    parsed = urlparse(url)
+                    file_path = unquote(parsed.path)
+                    if (
+                        sys.platform == "win32"
+                        and file_path.startswith("/")
+                        and len(file_path) > 2
+                        and file_path[2] == ":"
+                    ):
+                        file_path = file_path[1:]
+                    parts.append(
+                        f"\n[Attached Image File: {file_path}]\n"
+                        f"Please inspect and analyze the image at: {file_path}\n"
+                    )
+                elif os.path.isfile(url):
+                    parts.append(
+                        f"\n[Attached Image File: {url}]\n"
+                        f"Please inspect and analyze the image at: {url}\n"
+                    )
+                elif url.startswith(("http://", "https://")):
+                    parts.append(
+                        f"\n[Attached Image URL: {url}]\n"
+                        f"Please inspect and analyze the image at: {url}\n"
+                    )
+                else:
+                    parts.append(f"\n[Attached Image: {url}]\n")
+        return "\n".join(parts)
     return str(content or "")
 
 
@@ -909,7 +991,13 @@ def _render_agy_message(msg: Dict[str, Any]) -> str:
                 f"<arguments>{fn.get('arguments', '{}')}</arguments>\n"
                 "</tool_call>"
             )
-        payload = "\n".join(p for p in (text.strip(), "\n".join(call_strs)) if p)
+        thought = msg.get("reasoning_content") or msg.get("thought") or ""
+        thought_str = (
+            f"<think>\n{str(thought).strip()}\n</think>"
+            if thought and str(thought).strip()
+            else ""
+        )
+        payload = "\n".join(p for p in (thought_str, text.strip(), "\n".join(call_strs)) if p)
         return f"[Assistant]\n{payload}" if payload else ""
     if role == "user":
         return f"[User]\n{text}"
@@ -978,7 +1066,7 @@ def format_messages_for_agy(
     current_work = _clip_prompt_section(
         current_work,
         AGY_CURRENT_WORK_BUDGET_CHARS,
-        keep_tail=True,
+        keep_both=True,
     )
 
     fixed_sections = [

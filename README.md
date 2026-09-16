@@ -11,12 +11,19 @@ A native model-provider plugin (`kind: model-provider`) for **[Hermes Agent](htt
 - **Dynamic Model Discovery (via official `agy models` CLI):**
   - Directly queries `agy models` to discover and register all active models (Gemini 3.8 Flash, Gemini 3.7 Flash, Gemini 3.1 Pro, Claude Sonnet 4.6, Claude Opus 4.6, GPT-OSS 120B, etc.).
   - Includes a fallback catalog to guarantee uninterrupted service if the CLI query is delayed or offline.
-- **Real-Time Chain-of-Thought (CoT) Streaming:**
+- **Real-Time Chain-of-Thought (CoT) Streaming & Thought Preservation:**
   - Streams `<think>...</think>` reasoning tokens directly into Hermes under `reasoning_content`.
+  - Preserves prior reasoning tokens across turn iterations so the agent retains its internal train of thought.
   - Maps reasoning effort dials (`minimal`, `low`, `medium`, `high`) to corresponding model variants.
 - **Hermes-Compatible Streamed Tool Calling:**
   - Translates model `<tool_call>` outputs into standard OpenAI `tool_calls` chunks in real-time.
   - Full compatibility with Hermes' built-in tools (terminal execution, file manipulation, web search, MCP servers, and custom tools).
+- **Multimodal Vision Support:**
+  - Translates OpenAI multimodal `image_url` payloads (base64 data URIs, local file URIs, and HTTP URLs) into filesystem-backed image inspection prompts for `agy`.
+  - Enables Hermes vision tools (`vision_analyze`) to describe screenshots and image attachments with 100% accuracy.
+- **Anti-Amnesia Working Memory Architecture:**
+  - Expands working memory budget to **180,000 characters** (350,000 total prompt capacity), preventing intermediate tool outputs from choking the agent.
+  - Dual-end retention (`keep_both` strategy) preserves the initial goals/steps alongside latest outputs, preventing the agent from repeating actions or looping indefinitely on long tasks.
 - **Hardened Security Architecture:**
   - **No dangerous overrides**: Does **NOT** pass `--dangerously-skip-permissions`. In `stream-json` mode, `permission_mode` defaults to `request-review`. Antigravity native tool execution is constrained by AGY's request-review policy and terminal sandbox, while actionable host operations are intended to flow through Hermes tools.
   - **Terminal sandboxing**: Runs `agy` with `--sandbox` and `--disable-slash-commands` to prevent unintended command expansion.
